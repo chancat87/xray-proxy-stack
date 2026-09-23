@@ -42,7 +42,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.10.0"
+const agentVersion = "0.10.1"
 
 const (
 	commandTimeout  = 120 * time.Second // one psm command
