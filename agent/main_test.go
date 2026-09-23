@@ -383,6 +383,46 @@ func TestLeaveRemovesTheNodesThenTheAgent(t *testing.T) {
 	}
 }
 
+// The panel asks for a newer psm-agent. The upgrade replaces this binary and
+// restarts the service, so it must not begin before the panel has the result:
+// the restart would kill the very process that reports it, leaving the task
+// stuck in 下发中 forever.
+func TestTheAgentUpgradesItselfOnlyAfterReporting(t *testing.T) {
+	p := &fakePanel{tasks: []task{{ID: 7, Kind: "agent.update"}}}
+	f := &fakeRunner{}
+	a, done := newTestAgent(t, p, f)
+	defer done()
+	var spawned [][]string
+	a.spawn = func(args ...string) error { spawned = append(spawned, args); return nil }
+
+	if _, err := a.step(context.Background()); err != nil { // runs the task
+		t.Fatal(err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("the upgrade ran a psm command before reporting: %q", f.calls)
+	}
+	if len(spawned) != 0 || a.upgraded {
+		t.Fatal("psm-agent started upgrading itself before the panel had the result")
+	}
+	if _, err := a.step(context.Background()); err != nil { // delivers it
+		t.Fatal(err)
+	}
+	rs := results(t, p.requests[1]["results"])
+	if len(rs) != 1 || !rs[0].OK || string(rs[0].Output) != `{"from":"`+agentVersion+`"}` {
+		t.Fatalf("update result: %+v", rs)
+	}
+	if !a.upgraded || a.upgrading || !reflect.DeepEqual(spawned, [][]string{{"agent", "upgrade", "--yes"}}) {
+		t.Fatalf("after delivering: upgraded=%v upgrading=%v spawned=%q", a.upgraded, a.upgrading, spawned)
+	}
+	// started once: a later sync must not run the upgrade all over again
+	if _, err := a.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(spawned) != 1 {
+		t.Fatalf("the upgrade was started again: %q", spawned)
+	}
+}
+
 func TestABadLeavePlanRemovesNothing(t *testing.T) {
 	p := &fakePanel{tasks: []task{
 		{ID: 1, Kind: "agent.leave", Data: json.RawMessage(`{"nodes":[{"core":"xray","protocol":"reality","tag":"ok"},{"core":"xray","protocol":"reality","tag":"--all"}]}`)},

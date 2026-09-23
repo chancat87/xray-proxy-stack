@@ -11,9 +11,10 @@
 // Tasks: node.add (installing the core first when the server has never run
 // it), node.update, node.delete, node.export, standalone.install and
 // standalone.remove (Snell / ss-rust), traffic.set, traffic.reset,
-// traffic.report (send the counters with the next sync), status, and
-// agent.leave (the server was removed from the panel: delete the panel's
-// nodes, report, then uninstall psm-agent itself).
+// traffic.report (send the counters with the next sync), status, agent.update
+// (the panel asks for a newer psm-agent: report, then run psm agent upgrade
+// detached) and agent.leave (the server was removed from the panel: delete the
+// panel's nodes, report, then uninstall psm-agent itself).
 //
 //	psm-agent join -panel https://psm.example.com -token <join token>
 //	psm-agent run
@@ -41,7 +42,7 @@ import (
 	"time"
 )
 
-const agentVersion = "0.9.0"
+const agentVersion = "0.10.0"
 
 const (
 	commandTimeout  = 120 * time.Second // one psm command
@@ -264,6 +265,8 @@ type agent struct {
 	versionAt   time.Time
 	leaving     bool // agent.leave ran: uninstall once its result is delivered
 	left        bool // the uninstall has been started
+	upgrading   bool // agent.update ran: upgrade once its result is delivered
+	upgraded    bool // the upgrade has been started
 }
 
 // spawnDetached starts `psm <args>` outside psm-agent's service, so that it
@@ -274,7 +277,11 @@ func spawnDetached(psm string) func(args ...string) error {
 	return func(args ...string) error {
 		if _, err := os.Stat("/run/systemd/system"); err == nil {
 			if sr, err := exec.LookPath("systemd-run"); err == nil {
-				return exec.Command(sr, append([]string{"--unit", "psm-agent-leave", "--collect", "--quiet", psm}, args...)...).Run()
+				// a unit named after the command: leaving and upgrading must not
+				// share one, or the second fails to start while the first is
+				// still around
+				unit := "psm-" + strings.Join(args[:min(2, len(args))], "-")
+				return exec.Command(sr, append([]string{"--unit", unit, "--collect", "--quiet", psm}, args...)...).Run()
 			}
 		}
 		cmd := exec.Command(psm, args...)
@@ -748,6 +755,13 @@ func (a *agent) execute(ctx context.Context, t task) result {
 		// psm-agent goes in any case: the panel has forgotten this server
 		r.OK, r.Output = true, out
 		a.leaving = true
+	case "agent.update":
+		// Nothing is done here: the upgrade replaces this very binary and
+		// restarts the service, which would kill the process before it could
+		// report. psm agent upgrade is started detached once the panel has this
+		// result, the way agent.leave's uninstall is.
+		r.OK, r.Output = true, json.RawMessage(`{"from":"`+agentVersion+`"}`)
+		a.upgrading = true
 	case "traffic.report": // the panel's 流量 page asks for the counters now
 		a.lastTraffic = time.Time{}
 		r.OK = true
@@ -818,7 +832,8 @@ func (a *agent) step(ctx context.Context) (time.Duration, error) {
 			a.hasRelays = json.Unmarshal(rl, &probed) == nil && probed.Count > 0
 		}
 	}
-	delivering := a.leaving // this sync carries agent.leave's result
+	delivering := a.leaving  // this sync carries agent.leave's result
+	upgrading := a.upgrading // … or agent.update's
 	if err := post(ctx, a.cfg.Panel, "/api/agent/sync", a.cfg.Token, req, &resp); err != nil {
 		return 0, err
 	}
@@ -835,6 +850,19 @@ func (a *agent) step(ctx context.Context) (time.Duration, error) {
 		if a.spawn != nil {
 			if err := a.spawn("agent", "remove", "--yes"); err != nil {
 				log.Printf("could not start psm agent remove: %v", err)
+			}
+		}
+		return 0, nil
+	}
+	if upgrading {
+		// the panel has the result: psm agent upgrade updates PSM, installs the
+		// psm-agent that PSM then names and restarts the service — stopping
+		// this process. Cleared either way: a spawn that failed must not make
+		// every later sync try again.
+		a.upgrading, a.upgraded = false, true
+		if a.spawn != nil {
+			if err := a.spawn("agent", "upgrade", "--yes"); err != nil {
+				log.Printf("could not start psm agent upgrade: %v", err)
 			}
 		}
 		return 0, nil

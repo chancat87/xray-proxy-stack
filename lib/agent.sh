@@ -3,6 +3,7 @@
 #
 #   psm agent join --panel URL --token TOKEN   download psm-agent, join, run it as a service
 #   psm agent status [--json]                  installed, joined, running
+#   psm agent upgrade                          update PSM, then psm-agent itself
 #   psm agent remove --yes                     stop it and forget the panel
 #
 # psm-agent (agent/ in this repository) opens no port: it connects out to the
@@ -29,6 +30,7 @@ _agent_usage() {
 Usage:
   psm agent join --panel URL --token TOKEN
   psm agent status [--json]
+  psm agent upgrade
   psm agent remove --yes
 EOF
 }
@@ -129,6 +131,58 @@ _agent_join() {
     log_ok "Connected to ${panel}: psm-agent is running (it opens no port) and the panel shows this server online."
 }
 
+# Updates PSM, then psm-agent itself. The panel's 升级 agent button makes
+# psm-agent run this detached (restarting the service kills its own cgroup, so
+# an upgrade started inside it would not survive its first step).
+#
+# PSM is updated first because the release to install — PSM_AGENT_VERSION — is
+# named in this very file: a shell that sourced the old copy would faithfully
+# reinstall the old agent. Hence the re-exec after the pull, so that the
+# download below reads the new value.
+_agent_upgrade() {
+    local pull=1 have
+    while (( $# )); do
+        case "$1" in
+            --yes) shift ;;              # accepted for symmetry: nothing is destroyed
+            --no-pull) pull=0; shift ;;  # set by the re-exec below
+            *) _agent_err "unknown option: $1"; return 2 ;;
+        esac
+    done
+    [[ $EUID -eq 0 ]] || { _agent_err 'run as root'; return 1; }
+    [[ -f "$PSM_AGENT_CFG" ]] || { _agent_err 'this server has not joined a panel: nothing to upgrade'; return 1; }
+    _psm_detect_init
+    [[ "$_PSM_INIT" != none ]] || { _agent_err 'psm-agent runs as a service: systemd or OpenRC is needed'; return 1; }
+
+    if (( pull )); then
+        # shellcheck source=/dev/null
+        source "$PSM_ROOT/update.sh"
+        psm_update_scripts || _agent_err 'PSM could not be updated; keeping the version already checked out'
+        exec bash "$PSM_ROOT/manager.sh" agent upgrade --no-pull
+    fi
+
+    have=$("$PSM_AGENT_BIN" version 2>/dev/null || true)
+    if [[ "$have" == "$PSM_AGENT_VERSION" ]]; then
+        log_ok "psm-agent is already ${PSM_AGENT_VERSION}."
+        svc_is_active "$PSM_AGENT_SERVICE" || svc_restart "$PSM_AGENT_SERVICE" >/dev/null 2>&1 || true
+        return 0
+    fi
+    log_step "psm-agent ${have:-not installed} → ${PSM_AGENT_VERSION}"
+    _agent_download || return 1       # stops the service, checks sha256, installs
+    _agent_write_service || return 1  # the unit itself may have changed between versions
+    svc_enable "$PSM_AGENT_SERVICE" >/dev/null 2>&1 || true
+    svc_restart "$PSM_AGENT_SERVICE" >/dev/null 2>&1 || true
+    for _ in $(seq 1 10); do
+        svc_is_active "$PSM_AGENT_SERVICE" && break
+        sleep 1
+    done
+    if ! svc_is_active "$PSM_AGENT_SERVICE"; then
+        _agent_err 'psm-agent did not start after the upgrade'
+        svc_log_tail "$PSM_AGENT_SERVICE" 15 >&2
+        return 1
+    fi
+    log_ok "psm-agent ${PSM_AGENT_VERSION} is running; the panel shows the new version at the next sync."
+}
+
 _agent_status_json() {
     local installed=false joined=false active=false version="" panel=""
     if [[ -x "$PSM_AGENT_BIN" ]]; then installed=true; version=$("$PSM_AGENT_BIN" version 2>/dev/null || true); fi
@@ -161,6 +215,7 @@ psm_agent_cli() {
         status)
             if [[ "${1:-}" == --json ]]; then _agent_status_json
             else _agent_status_json | jq -r 'to_entries[] | "\(.key): \(.value)"'; fi ;;
+        upgrade|update) _agent_upgrade "$@" ;;
         remove|uninstall) _agent_remove "$@" ;;
         help|--help|-h) _agent_usage ;;
         *) _agent_usage >&2; return 2 ;;
