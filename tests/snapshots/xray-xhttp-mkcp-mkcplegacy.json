@@ -24,13 +24,16 @@
     "finalmask": {
       "udp": [
         {
-          "type": "header-srtp"
+          "settings": {
+            "value": "kcp-test-seed"
+          },
+          "type": "mkcp-legacy"
         },
         {
           "settings": {
-            "password": "kcp-test-seed"
+            "header": "srtp"
           },
-          "type": "mkcp-aes128gcm"
+          "type": "mkcp-legacy"
         }
       ]
     },

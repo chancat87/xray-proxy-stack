@@ -190,7 +190,7 @@ _mh_vless_uri() {
         grpc)                 q="${q}&serviceName=$(url_encode "${path#/}")" ;;
         ws|xhttp)             q="${q}&path=$(url_encode "$path")&host=$(url_encode "$sni")" ;;
     esac
-    [[ "$insec" == "1" ]] && q="${q}&allowInsecure=1"
+    [[ "$insec" == "1" ]] && q="${q}&allowInsecure=1$(psm_pin_q "$node" pcs)"
 
     local uri="vless://${uuid}@${host}:${port}?${q}#PSM-${tag}"
     echo -e "\n${BOLD}${GREEN}── mihomo VLESS: ${tag} ──${NC}"

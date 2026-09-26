@@ -89,8 +89,11 @@ _sub_standalone_uris() {
             "$hy2_cfg" 2>/dev/null)
         [[ -z "$d" ]] && insecure=1
         sni="${d:-$server}"
-        [[ -n "$pw" ]] && printf 'hysteria2://%s@%s:%s?insecure=%s&sni=%s#PSM-Hysteria2\n' \
-            "$(url_encode "$pw")" "$server" "$port" "$insecure" "$sni"
+        # the certificate the server presents (tls.cert), pinned when self-signed
+        local hy2_crt; hy2_crt=$(awk '/^[ \t]+cert:/ {print $2; exit}' "$hy2_cfg" 2>/dev/null)
+        [[ -n "$pw" ]] && printf 'hysteria2://%s@%s:%s?insecure=%s&sni=%s%s#PSM-Hysteria2\n' \
+            "$(url_encode "$pw")" "$server" "$port" "$insecure" "$sni" \
+            "$(psm_pin_q "$(jq -cn --argjson i "$insecure" --arg c "$hy2_crt" '{insecure: $i, cert_path: $c}')" pinSHA256)"
     fi
 
     # 独立 ss-rust
@@ -165,7 +168,24 @@ _sub_build_singbox_client() {
 }
 
 # 单个节点 → sing-box 客户端 outbound。不支持的协议返回空串由调用方跳过。
+# A self-signed node pins its certificate's public key
+# (certificate_public_key_sha256, sing-box 1.13+) instead of skipping
+# verification: see psm_node_pins in common.sh.
 _sub_sb_outbound() {
+    local ob pins
+    # sing-box has no VLESS Encryption: such a node (REALITY, Vision, XHTTP,
+    # mihomo VLESS) gets no outbound rather than one that cannot connect
+    [[ "$(printf '%s' "$3" | jq -r '(.vless_encryption // "") | if . == "" then "none" else . end')" == none ]] || return 0
+    ob=$(_sub_sb_outbound_plain "$@") || return 1
+    [[ -n "$ob" ]] || return 0
+    pins=$(psm_node_pins "$3")
+    printf '%s' "$ob" | jq -c --argjson p "$pins" '
+        if ($p.spki // "") != "" and (.tls.insecure // false) then
+            .tls |= (del(.insecure) + {certificate_public_key_sha256: [$p.spki]})
+        else . end'
+}
+
+_sub_sb_outbound_plain() {
     local core="$1" proto="$2" n="$3" server="$4" tag="$5"
     local port; port=$(printf '%s' "$n" | jq -r '.public_port // .port')
     # sing-box has no XHTTP transport (mihomo's VLESS has it): such a node has
@@ -225,10 +245,14 @@ _sub_sb_outbound() {
                   --arg pw "$(printf '%s' "$n" | jq -r '.password')" \
                   --arg sn "$(printf '%s' "$n" | jq -r '.sni')" \
                   --argjson ins "$(printf '%s' "$n" | jq -r '.insecure | if . == true then 1 elif . == false then 0 else . end')" \
-                  --arg hop "$(printf '%s' "$n" | jq -r '.hop_ports // ""')" '
+                  --arg hop "$(printf '%s' "$n" | jq -r '.hop_ports // ""')" \
+                  --arg obfs "$(printf '%s' "$n" | jq -r '.obfs_pass // ""')" \
+                  --arg otype "$(printf '%s' "$n" | jq -r '.obfs_type // "salamander"')" '
                 { type:"hysteria2", tag:$t, server:$s, server_port:$p, password:$pw,
                   tls:{ enabled:true, server_name:$sn, insecure:($ins == 1) } }
-                + (if $hop != "" then { server_ports: [($hop | sub("-"; ":"))], hop_interval: "30s" } else {} end)' ;;
+                + (if $hop != "" then { server_ports: [($hop | sub("-"; ":"))], hop_interval: "30s" } else {} end)
+                # the obfuscation the server expects (without it such a node never connected)
+                + (if $obfs != "" then { obfs: { type: $otype, password: $obfs } } else {} end)' ;;
         anytls)
             jq -n --arg t "PSM-$tag" --arg s "$server" --argjson p "$port" \
                   --arg pw "$(printf '%s' "$n" | jq -r '.password')" \
@@ -252,12 +276,19 @@ _sub_sb_outbound() {
 # node imported from its link never connects. Written out with
 # skip-cert-verify (and everything else) it does. Other protocols print
 # nothing: their share links import as they are.
+# A self-signed node also carries its certificate's SHA-256 as fingerprint:
+# mihomo then checks that one certificate even with skip-cert-verify on (its
+# VerifyConnection runs either way), while clients that read the Clash format
+# without fingerprint (Stash) keep skipping verification as before.
 _sub_mh_proxy() {
     local core="$1" proto="$2" n="$3" server="$4" tag="$5"
     local port; port=$(printf '%s' "$n" | jq -r '.public_port // .port')
-    case "$proto" in vless|trojan|vmess|hysteria2|anytls|tuic|ss2022|reality|vision|socks) ;; *) return 0 ;; esac
+    n=$(psm_node_with_pins "$n")
+    case "$proto" in vless|trojan|vmess|hysteria2|anytls|tuic|ss2022|reality|vision|socks|xhttp) ;; *) return 0 ;; esac
     # a loopback SOCKS5 node has no address a client could use
     [[ "$proto" == socks && "$(printf '%s' "$n" | jq -r '.listen_addr // ""')" == "127.0.0.1" ]] && return 0
+    # Xray's mKCP: mihomo's VLESS has no mKCP transport
+    [[ "$proto" == xhttp && "$(printf '%s' "$n" | jq -r '.mode // ""')" == mkcp ]] && return 0
     # mihomo's VLESS has no QUIC transport
     [[ "$proto" == vless && "$(printf '%s' "$n" | jq -r '.transport // "tcp"')" == quic ]] && return 0
     jq -cn --arg name "PSM-$tag" --arg core "$core" --arg proto "$proto" --arg s "$server" \
@@ -292,6 +323,26 @@ _sub_mh_proxy() {
              "client-fingerprint": "chrome"}
             + (if ($n.flow // "") != "" then {flow: $n.flow} else {} end)
             + (if ($n.vless_encryption // "") != "" then {encryption: $n.vless_encryption} else {} end))
+         elif $proto == "xhttp" then
+           # VLESS of the Xray xhttp store over XHTTP / WS / gRPC / HTTPUpgrade /
+           # HTTP2 (XHTTP stream-one) or a REALITY layer, as _xhttp_share_uri links
+           # them. HTTPUpgrade is the mihomo ws with v2ray-http-upgrade: the mihomo
+           # link importer turns type=httpupgrade into a network its VLESS lacks.
+           (($n.mode // "xhttp") as $m | ($n.path // "/") as $path | ($n.domain // "") as $dom
+            | {type: "vless", uuid: $n.uuid, udp: true, tls: true, "client-fingerprint": "chrome"}
+            + (if ($n.vless_encryption // "") != "" then {encryption: $n.vless_encryption} else {} end)
+            + (if $m == "reality-layer" then
+                 {servername: $n.server_name, "reality-opts": {"public-key": $n.public_key, "short-id": ($n.short_id // "")}}
+                 + (if ($n.reality_transport // "xhttp") == "grpc"
+                    then {network: "grpc", "grpc-opts": {"grpc-service-name": ($path | ltrimstr("/"))}}
+                    else {network: "xhttp", "xhttp-opts": {path: $path, mode: "auto"}} end)
+               else {servername: $dom}
+                 + (if   $m == "grpc"        then {network: "grpc", "grpc-opts": {"grpc-service-name": ($path | ltrimstr("/"))}}
+                    elif $m == "ws" or $m == "upgrade" then {network: "ws", "ws-opts": {path: $path, headers: {Host: $dom}}}
+                    elif $m == "httpupgrade" then {network: "ws", "ws-opts": {path: $path, headers: {Host: $dom}, "v2ray-http-upgrade": true}}
+                    elif $m == "h2"          then {network: "xhttp", alpn: ["h2"], "xhttp-opts": {path: $path, host: $dom, mode: "stream-one"}}
+                    else {network: "xhttp", "xhttp-opts": {path: $path, host: $dom, mode: "auto"}} end)
+               end))
          elif $proto == "socks" then
            ({type: "socks5", udp: true}
             + (if ($n.username // "") != "" then {username: $n.username, password: $n.password} else {} end))
@@ -311,7 +362,8 @@ _sub_mh_proxy() {
            {type: "tuic", uuid: $n.uuid, password: $n.password, sni: $sni, "skip-cert-verify": $ins, alpn: ["h3"],
             "congestion-controller": ($n.congestion_control // "bbr"), "udp-relay-mode": "native"}
          end)
-      + (if ($n.ech_config // "") != "" then {"ech-opts": {enable: true, config: $n.ech_config}} else {} end)'
+      + (if ($n.ech_config // "") != "" then {"ech-opts": {enable: true, config: $n.ech_config}} else {} end)
+      + (if ($n._pin.sha256 // "") != "" and $ins then {fingerprint: $n._pin.sha256} else {} end)'
 }
 
 # ── mihomo 客户端配置 ─────────────────────────────────────────────────────────
@@ -341,10 +393,18 @@ _sub_build_mihomo_client() {
         | .node as $n
         | { name: ("PSM-" + $n.tag), server: $s, port: ($n.public_port // $n.port), uuid: (if $u == null then $n.uuid else $u.uuid end),
             host: (if (.core == "xray") then $n.domain else $n.sni end), path: ($n.path // "/"),
-            insecure: (($n.insecure // 0) | tostring | test("^(1|true)$")) }]' 2>/dev/null) || hu_json='[]'
+            insecure: (($n.insecure // 0) | tostring | test("^(1|true)$")), cert_path: ($n.cert_path // "") }]' 2>/dev/null) || hu_json='[]'
+    # self-signed: pin the certificate as well (psm_node_pins)
+    local hu_e hu_pinned='[]'
+    while IFS= read -r hu_e; do
+        [[ -n "$hu_e" ]] || continue
+        hu_e=$(psm_node_with_pins "$hu_e")
+        hu_pinned=$(jq -c --argjson e "$hu_e" '. + [$e]' <<<"$hu_pinned")
+    done < <(jq -c '.[]' <<<"${hu_json:-[]}")
+    hu_json="$hu_pinned"
     if [[ "$(jq 'length' <<<"${hu_json:-[]}")" != "0" ]]; then
         hu_filter=$(jq -r '[.[].name | gsub("(?<c>[.^$*+?()\\[\\]{}|\\\\])"; "\\\(.c)")] | "^(" + join("|") + ")$"' <<<"$hu_json")
-        hu_proxies=$(jq -r '.[] | "  - {name: \(.name|@json), type: vless, server: \(.server|@json), port: \(.port), uuid: \(.uuid|@json), tls: true, servername: \(.host|@json), skip-cert-verify: \(.insecure), network: ws, ws-opts: {path: \(.path|@json), headers: {Host: \(.host|@json)}, v2ray-http-upgrade: true}}"' <<<"$hu_json")
+        hu_proxies=$(jq -r '.[] | "  - {name: \(.name|@json), type: vless, server: \(.server|@json), port: \(.port), uuid: \(.uuid|@json), tls: true, servername: \(.host|@json), skip-cert-verify: \(.insecure), \(if (._pin.sha256 // "") != "" and .insecure then "fingerprint: \(._pin.sha256|@json), " else "" end)network: ws, ws-opts: {path: \(.path|@json), headers: {Host: \(.host|@json)}, v2ray-http-upgrade: true}}"' <<<"$hu_json")
         hu_names=$(jq -r '.[] | "      - \(.name|@json)"' <<<"$hu_json")
     fi
 

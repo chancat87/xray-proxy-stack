@@ -243,7 +243,13 @@ hy2_show_share() {
     [[ -z "$domain" ]] && insecure=1
 
     local sni="${domain:-${ip}}"
-    local uri="hysteria2://${password}@${ip}:${port}?insecure=${insecure}&sni=${sni}#PSM-Hysteria2"
+    # a self-signed certificate: its SHA-256 as well, for clients that pin it
+    # (Xray's refuse "insecure" — see psm_node_pins in common.sh)
+    local selfsigned pin="" pin_yaml=""
+    selfsigned=$(jq -cn --argjson i "$insecure" --arg c "$HY2_SELF_SIGNED_CERT" '{insecure: $i, cert_path: $c}')
+    pin=$(psm_pin_q "$selfsigned" pinSHA256)
+    pin_yaml=$(psm_pin_yaml "$selfsigned"); [[ -n "$pin_yaml" ]] && pin_yaml=$'\n'"$pin_yaml"
+    local uri="hysteria2://${password}@${ip}:${port}?insecure=${insecure}&sni=${sni}${pin}#PSM-Hysteria2"
 
     echo -e "\n${BOLD}${GREEN}── $(t hysteria2.share_title) ──${NC}"
     [[ $insecure -eq 1 ]] && echo -e "  ${YELLOW}$(t hysteria2.share_self_cert)${NC}"
@@ -260,7 +266,7 @@ proxies:
     port: ${port}
     password: "${password}"
     sni: ${sni}
-    skip-cert-verify: $([[ $insecure -eq 1 ]] && echo true || echo false)
+    skip-cert-verify: $([[ $insecure -eq 1 ]] && echo true || echo false)${pin_yaml}
 EOF
 }
 

@@ -218,13 +218,16 @@ _outb_build_xray() {
         # 连接打上 fwmark：内核的 ip rule 认标记，把这些连接引进家宽隧道的独立
         # 路由表。这样出站配置与具体家宽节点无关——换节点只重拨隧道，配置不动。
         # 锁 UseIPv4：隧道只承载 IPv4，解析到 AAAA 会打进隧道表里的 IPv6 黑洞。
+        # It sits in sockopt, not in settings: Xray v26.9.9 deprecates
+        # freedom.domainStrategy ("will be removed") for sockopt.domainStrategy,
+        # which v26.3.27 takes as well.
         local mark
         mark=$(echo "$e" | jq -r '.mark // 8433')
         jq -n --arg tag "$tag" --argjson mark "$mark" \
         '{
             tag: $tag, protocol: "freedom",
-            settings: { domainStrategy: "UseIPv4" },
-            streamSettings: { sockopt: { mark: $mark } }
+            settings: {},
+            streamSettings: { sockopt: { mark: $mark, domainStrategy: "UseIPv4" } }
         }'
         ;;
     esac

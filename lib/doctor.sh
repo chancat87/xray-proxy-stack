@@ -408,6 +408,32 @@ _doctor_check_hop() {
     fi
 }
 
+# Xray mKCP: each node's inbound as this Xray needs it (_xray_kcp_form and the
+# mask order, xray/xhttp.sh). Older PSM wrote kcpSettings.seed on v26.9.9 and the
+# disguise header after the cipher on v26.3.27 — both accepted by the core and
+# reachable by no client. The node store is the truth: an inbound that differs
+# from what it builds now is rewritten by --fix.
+_doctor_check_kcp() {
+    local cfg="$XRAY_CFG_DIR/config.json" store="$CFG_DIR/xray/xhttp.json" node tag want live n=0 stale=0
+    [[ -r "$cfg" && -r "$store" && -x "$XRAY_BIN" ]] || return 0
+    jq -e 'any(.[]?; .mode == "mkcp")' "$store" >/dev/null 2>&1 || return 0
+    source "$LIB_DIR/xray/xhttp.sh"
+    while IFS= read -r node; do
+        [[ -n "$node" ]] || continue
+        n=$((n + 1)); tag=$(jq -r '.tag' <<<"$node")
+        want=$(_xhttp_build_inbound "$node" 2>/dev/null | jq -S -c '.streamSettings')
+        live=$(jq -S -c --arg t "$tag" 'first(.inbounds[]? | select(.tag == $t)) | .streamSettings' "$cfg" 2>/dev/null)
+        [[ -n "$want" && "$want" == "$live" ]] || stale=$((stale + 1))
+    done < <(jq -c '.[] | select(.mode == "mkcp")' "$store" 2>/dev/null)
+    if (( stale > 0 )); then
+        _doctor_add "xray.kcp" "configuration" "warning" "$(t doctor.msg.kcp_old "$stale" "$n")" \
+            "$(_doctor_details nodes "$n" stale "$stale" xray_form "$(_xray_kcp_form)")" "_doctor_fix_kcp"
+    else
+        _doctor_add "xray.kcp" "configuration" "ok" "$(t doctor.msg.kcp_ok "$n")" \
+            "$(_doctor_details nodes "$n" stale "0" xray_form "$(_xray_kcp_form)")"
+    fi
+}
+
 # ── Repairs (psm doctor --fix) ────────────────────────────────────────────────
 # Each runs in a subshell with stdout on stderr and no terminal input, and
 # returns 0 when it believes the problem is gone; the checks run again after.
@@ -445,6 +471,8 @@ _doctor_fix_jq() { ensure_modern_jq && _jq_is_modern; }
 _doctor_fix_boot() { svc_enable "$1" && svc_is_enabled "$1"; }
 
 _doctor_fix_hop() { source "$LIB_DIR/hop.sh" && psm_hop_sync; }
+
+_doctor_fix_kcp() { source "$LIB_DIR/xray/xhttp.sh" && _xhttp_apply_all; }
 
 # acme.sh decides what is due; a 90-day certificate with under 14 days left is.
 _doctor_fix_cert() {
@@ -527,6 +555,7 @@ _doctor_collect() {
     _doctor_check_disk
     _doctor_check_certificates
     _doctor_check_hop
+    _doctor_check_kcp
     _doctor_check_tun
 }
 

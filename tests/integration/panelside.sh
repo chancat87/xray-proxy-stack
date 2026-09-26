@@ -134,10 +134,13 @@ kill "$sbc" 2>/dev/null
 chk "sing-box VLESS over WebSocket, no certificate, an SNI of our own" bash -c \
     'psm node add sing-box vless --tag t-vl --port 30502 --set transport=ws --set sni=vl.example.org --json | jq -e ".status == \"created\"" && fwc 30502 tcp'
 chk "… its link accepts the certificate (allowInsecure=1)" bash -c 'psm node export sing-box vless t-vl --server 203.0.113.5 | grep -q "sni=vl.example.org&type=ws&allowInsecure=1"'
-chk "… as a sing-box outbound: tls.insecure" bash -c \
-    'psm node export sing-box vless t-vl --server 203.0.113.5 --format singbox | jq -e ".tls.insecure == true and .tls.server_name == \"vl.example.org\""'
-chk "… as a mihomo proxy: skip-cert-verify, ws" bash -c \
-    'psm node export sing-box vless t-vl --server 203.0.113.5 --format clash | jq -e ".type == \"vless\" and .\"skip-cert-verify\" == true and .network == \"ws\" and .servername == \"vl.example.org\" and .port == 30502"'
+# a self-signed certificate is pinned, not skipped (Xray refuses allowInsecure since 2026-06-01)
+chk "… as a sing-box outbound: its public key pinned, not insecure" bash -c \
+    'psm node export sing-box vless t-vl --server 203.0.113.5 --format singbox | jq -e "(.tls.certificate_public_key_sha256 | length) == 1 and (.tls.insecure | not) and .tls.server_name == \"vl.example.org\""'
+chk "… as a mihomo proxy: skip-cert-verify and its fingerprint, ws" bash -c \
+    'psm node export sing-box vless t-vl --server 203.0.113.5 --format clash | jq -e ".type == \"vless\" and .\"skip-cert-verify\" == true and (.fingerprint | test(\"^[0-9a-f]{64}$\")) and .network == \"ws\" and .servername == \"vl.example.org\" and .port == 30502"'
+chk "… its link: allowInsecure and pcs" bash -c \
+    '[[ $(psm node export sing-box vless t-vl --server 203.0.113.5) =~ allowInsecure=1\&pcs=[0-9a-f]{64} ]]'
 chk "SS2022 as a mihomo proxy" bash -c \
     'psm node export sing-box ss2022 t-ss --server 203.0.113.5 --format clash | jq -e ".type == \"ss\" and .server == \"203.0.113.5\" and .port == 30001 and (.cipher | startswith(\"2022-\"))"'
 chk "Snell has no mihomo proxy (mihomo speaks Snell v1-v3 only) → 2" bash -c \

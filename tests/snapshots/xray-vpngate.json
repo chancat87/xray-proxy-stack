@@ -1,10 +1,9 @@
 {
   "protocol": "freedom",
-  "settings": {
-    "domainStrategy": "UseIPv4"
-  },
+  "settings": {},
   "streamSettings": {
     "sockopt": {
+      "domainStrategy": "UseIPv4",
       "mark": 8433
     }
   },

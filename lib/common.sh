@@ -601,6 +601,23 @@ ask_hy2_obfs_pass() {
     printf -v "$_hy2_var" '%s' "$_hy2_pw"
 }
 
+# ask_hy2_bbr_profile <var_name>: how hard a Hysteria2 server's BBR sends —
+# empty (the core's default, standard), conservative or aggressive. New in all
+# three cores this year (sing-box 1.14, mihomo 1.19.24, Xray v26.4.13).
+ask_hy2_bbr_profile() {
+    local _bbr_var="$1" _bbr_c
+    echo -e "  $(t common.hy2.bbr_title)"
+    echo -e "    $(t common.hy2.bbr1)"
+    echo -e "    $(t common.hy2.bbr2)"
+    echo -e "    $(t common.hy2.bbr3)"
+    read -rp "$(echo -e "${CYAN}$(t common.hy2.ask_bbr)${NC}")" _bbr_c
+    case "$_bbr_c" in
+        2) printf -v "$_bbr_var" '%s' conservative ;;
+        3) printf -v "$_bbr_var" '%s' aggressive ;;
+        *) printf -v "$_bbr_var" '%s' '' ;;
+    esac
+}
+
 ask_yn() {
     # ask_yn <prompt> [Y|N]  → returns 0=yes 1=no
     local prompt="$1" default="${2:-Y}"
@@ -930,6 +947,72 @@ _sb_ech_merge() {
 }
 _mh_ech_merge() {
     jq --argjson n "$1" 'if ($n.ech_key // "") != "" then ."ech-key" = $n.ech_key else . end'
+}
+
+# ── Certificate pinning for self-signed TLS nodes ────────────────────────────
+# A node with insecure = 1 has a certificate no CA vouches for (PSM signed it,
+# or the user brought a self-signed one). Its exports used to tell clients to
+# skip verification, but Xray refuses "allowInsecure" outright since
+# 2026-06-01 (v26.6.2 deleted the field), and v2rayN, v2rayNG, Happ … no
+# longer pass it on: they pin the certificate given in the link instead (pcs =
+# pinnedPeerCertSha256, hysteria2:// pinSHA256). So every export of such a node
+# carries the pin next to the old flag: clients that know the pin check the one
+# certificate, the others keep skipping verification as before.
+
+# psm_cert_sha256 <cert file>: SHA-256 of its first (leaf) certificate, DER,
+# as 64 lowercase hex digits — what pcs, pinSHA256, mihomo's fingerprint,
+# Surge, Quantumult X and Loon take.
+psm_cert_sha256() {
+    [[ -r "${1:-}" ]] || return 1
+    local fp
+    fp=$(openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    fp=${fp#*=}; fp=${fp//:/}
+    [[ "$fp" =~ ^[0-9A-Fa-f]{64}$ ]] || return 1
+    printf '%s' "${fp,,}"
+}
+
+# psm_cert_spki_sha256 <cert file>: SHA-256 of its public key (SPKI, DER) in
+# base64 — sing-box's certificate_public_key_sha256 (1.13+).
+psm_cert_spki_sha256() {
+    [[ -r "${1:-}" ]] || return 1
+    local h
+    h=$(openssl x509 -in "$1" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform der 2>/dev/null \
+        | openssl dgst -sha256 -binary 2>/dev/null | openssl base64 -A 2>/dev/null) || return 1
+    [[ ${#h} -eq 44 ]] || return 1
+    printf '%s' "$h"
+}
+
+# psm_node_pins <node json>: {"sha256": hex, "spki": base64} for a node whose
+# certificate is self-signed (insecure = 1 and cert_path readable), else {}.
+# The export builders merge it into the node (._pin) — jq cannot hash files.
+psm_node_pins() {
+    local n="$1" cp crt spki
+    [[ "$(printf '%s' "$n" | jq -r '(.insecure // 0) | tostring')" =~ ^(1|true)$ ]] || { printf '{}'; return 0; }
+    cp=$(printf '%s' "$n" | jq -r '.cert_path // ""')
+    crt=$(psm_cert_sha256 "$cp") || { printf '{}'; return 0; }
+    spki=$(psm_cert_spki_sha256 "$cp") || spki=""
+    jq -cn --arg c "$crt" --arg s "$spki" '{sha256: $c} + (if $s == "" then {} else {spki: $s} end)'
+}
+
+# psm_node_with_pins <node json>: the node with ._pin set (see psm_node_pins)
+psm_node_with_pins() {
+    printf '%s' "$1" | jq -c --argjson p "$(psm_node_pins "$1")" '._pin = $p'
+}
+
+# psm_pin_q <node json> <parameter>: "&<parameter>=<sha256>" for a
+# self-signed node, for its share link (pcs, pinSHA256, hpkp); else nothing.
+psm_pin_q() {
+    [[ "$(printf '%s' "$1" | jq -r '(.insecure // 0) | tostring')" =~ ^(1|true)$ ]] || return 0
+    local pin; pin=$(psm_cert_sha256 "$(printf '%s' "$1" | jq -r '.cert_path // ""')") || return 0
+    printf '&%s=%s' "$2" "$pin"
+}
+
+# psm_pin_yaml <node json>: "    fingerprint: <sha256>" and a newline for a
+# self-signed node, to go into a Clash proxy the menus print; else nothing.
+psm_pin_yaml() {
+    local q; q=$(psm_pin_q "$1" fingerprint)
+    [[ -n "$q" ]] && printf '    fingerprint: %s\n' "${q#&fingerprint=}"
+    return 0
 }
 
 # Free TCP port on loopback for throwaway listeners (probes).

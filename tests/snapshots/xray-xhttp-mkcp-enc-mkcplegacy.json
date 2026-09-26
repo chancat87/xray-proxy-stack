@@ -9,8 +9,7 @@
         "id": "66666666-6666-4666-8666-666666666666"
       }
     ],
-    "decryption": "none",
-    "fallbacks": []
+    "decryption": "mlkem768x25519plus.native.600s.-Ml20GaEPBtF8DcrC2-UN1uhUTooSNoaXiS90RvsrlA"
   },
   "sniffing": {
     "destOverride": [
@@ -24,13 +23,16 @@
     "finalmask": {
       "udp": [
         {
-          "type": "header-srtp"
+          "settings": {
+            "value": "kcp-test-seed"
+          },
+          "type": "mkcp-legacy"
         },
         {
           "settings": {
-            "password": "kcp-test-seed"
+            "header": "srtp"
           },
-          "type": "mkcp-aes128gcm"
+          "type": "mkcp-legacy"
         }
       ]
     },
@@ -46,5 +48,5 @@
     "network": "kcp",
     "security": "none"
   },
-  "tag": "xhttp-kcp"
+  "tag": "xhttp-kcp-enc"
 }

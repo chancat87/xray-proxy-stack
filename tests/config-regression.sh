@@ -135,15 +135,19 @@ assert_snapshot mihomo-socks mihomo_socks _mh_socks_build_listener
 #
 # 以下几处都是用真实内核（Xray v26.3.27 / v26.9.9）校验后改的，见 tests/core-validate.sh：
 #   h2      旧 HTTP 传输已被 Xray 移除 → 改由 XHTTP stream-one 承载（network=xhttp）
-#   mkcp    seed/header 的写法两个版本互不兼容，运行时由 _xray_kcp_legacy_ok 探测本机
+#   mkcp    seed/header 有三种写法（kcpSettings / finalmask mkcp-aes128gcm / mkcp-legacy），运行时由 _xray_kcp_form 探测本机
 #           内核二选一；这里两条分支都打桩，结果不随测试机上装没装 Xray 而变
 #   reality+ws  Xray 会拒绝整份配置；store 里残留的 ws 值必须落到 xhttp，快照钉住这一点
 assert_snapshot xray-xhttp-httpupgrade xray_xhttp_httpupgrade _xhttp_build_inbound
 assert_snapshot xray-xhttp-h2 xray_xhttp_h2 _xhttp_build_inbound
-_xhttp_build_kcp_legacy()    { ( _xray_kcp_legacy_ok() { return 0; }; _xhttp_build_inbound "$1" ); }
-_xhttp_build_kcp_finalmask() { ( _xray_kcp_legacy_ok() { return 1; }; _xhttp_build_inbound "$1" ); }
-assert_snapshot xray-xhttp-mkcp           xray_xhttp_mkcp _xhttp_build_kcp_legacy
-assert_snapshot xray-xhttp-mkcp-finalmask xray_xhttp_mkcp _xhttp_build_kcp_finalmask
+# hermetic: neither the form nor the mask order may depend on an Xray installed
+# where the tests run (the full suites run them after installing v26.3.27)
+_xhttp_build_kcp_legacy()     { ( _xray_kcp_form() { printf legacy; };      _xray_masks_reversed() { return 1; }; _xhttp_build_inbound "$1" ); }
+_xhttp_build_kcp_finalmask()  { ( _xray_kcp_form() { printf finalmask; };   _xray_masks_reversed() { return 0; }; _xhttp_build_inbound "$1" ); }
+_xhttp_build_kcp_mkcplegacy() { ( _xray_kcp_form() { printf mkcp-legacy; }; _xray_masks_reversed() { return 1; }; _xhttp_build_inbound "$1" ); }
+assert_snapshot xray-xhttp-mkcp             xray_xhttp_mkcp _xhttp_build_kcp_legacy
+assert_snapshot xray-xhttp-mkcp-finalmask   xray_xhttp_mkcp _xhttp_build_kcp_finalmask
+assert_snapshot xray-xhttp-mkcp-mkcplegacy  xray_xhttp_mkcp _xhttp_build_kcp_mkcplegacy
 assert_snapshot xray-xhttp-reality-ws   xray_xhttp_reality_ws   _xhttp_build_inbound
 assert_snapshot xray-xhttp-reality-grpc xray_xhttp_reality_grpc _xhttp_build_inbound
 
@@ -225,12 +229,25 @@ assert_snapshot singbox-wireguard      singbox_wireguard      _sb_wg_build_endpo
 assert_snapshot singbox-hy2-ech        singbox_hy2_ech        _sb_hy2_build_inbound
 assert_snapshot mihomo-hy2-ech         mihomo_hy2_ech         _mh_hy2_build_listener
 
+# Hysteria2 BBR 配置档（服务端发送方向）：sing-box 1.14 的 bbr_profile、mihomo 1.19.24
+# 的 bbr-profile、Xray v26.4.13 的 finalmask.quicParams.bbrProfile——Xray 那边要与
+# 混淆的 finalmask.udp 并存在同一个 finalmask 里，没有混淆时 finalmask 只有 quicParams。
+assert_snapshot singbox-hy2-bbr        singbox_hy2_bbr        _sb_hy2_build_inbound
+assert_snapshot mihomo-hy2-bbr         mihomo_hy2_bbr         _mh_hy2_build_listener
+assert_snapshot xray-hy2-bbr           xray_hy2_bbr           _xhy2_build_inbound
+assert_snapshot xray-hy2-bbr-plain     xray_hy2_bbr_plain     _xhy2_build_inbound
+
 # VLESS Encryption（后量子）：decryption 串原样写进入站；Vision / XHTTP 启用后
 # fallbacks 必须清空——Xray 规定两者互斥（两张夹具都故意开着 fallback_enabled）。
 # mihomo vless listener 用同一种串格式（由 mihomo generate 的裸密钥拼出）。
 assert_snapshot xray-vision-enc  xray_vision_enc  _vision_build_inbound
 assert_snapshot xray-reality-enc xray_reality_enc _reality_build_inbound
 assert_snapshot xray-xhttp-enc   xray_xhttp_enc   _xhttp_build_inbound
+# mKCP 默认带 VLESS Encryption（Xray v26.7.7 起客户端拒绝无 TLS 的明文 VLESS）；
+# seed/header 两种写法与 xray-xhttp-mkcp 一样成对钉住
+assert_snapshot xray-xhttp-mkcp-enc             xray_xhttp_mkcp_enc _xhttp_build_kcp_legacy
+assert_snapshot xray-xhttp-mkcp-enc-finalmask   xray_xhttp_mkcp_enc _xhttp_build_kcp_finalmask
+assert_snapshot xray-xhttp-mkcp-enc-mkcplegacy  xray_xhttp_mkcp_enc _xhttp_build_kcp_mkcplegacy
 assert_snapshot mihomo-vless-enc mihomo_vless_enc _mh_vless_build_listener
 
 # ShadowTLS v3（mihomo listener）：users 是 [{name, password}]，握手目标写在

@@ -48,6 +48,14 @@ with_test_certs() {
 }
 
 passed=0 failed=0 skipped=0
+# SHOW_WARNINGS=1: also print what a core warns about in a config it accepts —
+# deprecations are next release's failures (sing-box: "deprecated … will be
+# removed in 1.16.0"; Xray: "[Warning] … deprecated").
+warnings() {   # warnings <core output>
+    [[ "${SHOW_WARNINGS:-0}" == 1 ]] || return 0
+    printf '%s\n' "$1" | grep -iE 'deprecat|will be removed|removed in|\[warn|level=warn|WARN' \
+        | grep -viE 'ClientHello|failed to .*(listen|dial)' | sed 's/^/       warn: /' | head -n 8
+}
 report() {   # report <ok|FAIL|skip> <core> <snapshot> [error output]
     case "$1" in
         ok)   passed=$((passed + 1)) ;;
@@ -83,35 +91,47 @@ validate_xray() {
     asset="${XRAY_ASSET_DIR:-$(dirname "$bin")}"
     for snap in "$SNAPSHOT_DIR"/xray-*.json "$SNAPSHOT_DIR"/ruleset-xray-inline.json; do
         name="$(basename "$snap" .json)"
-        case "$name" in xray-xhttp-mkcp|xray-xhttp-mkcp-finalmask) continue ;; esac   # pair, below
+        case "$name" in xray-xhttp-mkcp*) continue ;; esac   # legacy/finalmask pairs, below
         cfg="$tmp/$name.json"
         xray_wrap "$(with_test_certs "$snap")" "$name" > "$cfg"
         if [[ "$name" == xray-route-geosite && ! -s "$asset/geosite.dat" ]]; then
             report skip "$label" "$name (no geosite.dat in $asset)"; continue
         fi
         if out=$(XRAY_LOCATION_ASSET="$asset" "$bin" run -test -config "$cfg" 2>&1); then
-            report ok "$label" "$name"
+            report ok "$label" "$name"; warnings "$out"
         else
             report FAIL "$label" "$name" "$out"
         fi
     done
 
-    # mKCP seed/header: the legacy and finalmask forms are mutually exclusive
-    # across Xray versions, and PSM picks one at runtime (_xray_kcp_legacy_ok).
-    # What must hold is that every core accepts at least one of them.
-    local style="" pair
-    for pair in xray-xhttp-mkcp:legacy xray-xhttp-mkcp-finalmask:finalmask; do
-        name="${pair%%:*}"
-        [[ -f "$SNAPSHOT_DIR/$name.json" ]] || continue
-        cfg="$tmp/$name.json"
-        xray_wrap "$(with_test_certs "$SNAPSHOT_DIR/$name.json")" "$name" > "$cfg"
-        if out=$("$bin" run -test -config "$cfg" 2>&1); then style="${pair#*:}"; break; fi
+    # mKCP seed/header: three forms, and PSM writes the first the installed Xray
+    # takes, in this order (_xray_kcp_form): mkcp-legacy, finalmask, legacy.
+    # What must hold is that every core accepts one of them; the one it lands on
+    # is reported.
+    local style base pair
+    for base in xray-xhttp-mkcp xray-xhttp-mkcp-enc; do
+        [[ -f "$SNAPSHOT_DIR/$base.json" ]] || continue
+        style=""
+        # an Xray that ignores finalmask altogether (v25) passes any form; PSM
+        # detects it with a mask type that does not exist, and so does this
+        local order=("$base-mkcplegacy:mkcp-legacy" "$base-finalmask:finalmask" "$base:legacy")
+        jq -n '{inbounds: [{port: 1, protocol: "vless", settings: {clients: [], decryption: "none"},
+                  streamSettings: {network: "kcp", security: "none", finalmask: {udp: [{type: "psm-no-such-mask"}]}}}],
+                outbounds: [{protocol: "freedom"}]}' > "$tmp/kcp-probe.json"
+        "$bin" run -test -config "$tmp/kcp-probe.json" &>/dev/null && order=("$base:legacy")
+        for pair in "${order[@]}"; do
+            name="${pair%%:*}"
+            [[ -f "$SNAPSHOT_DIR/$name.json" ]] || continue
+            cfg="$tmp/$name.json"
+            xray_wrap "$(with_test_certs "$SNAPSHOT_DIR/$name.json")" "$name" > "$cfg"
+            if out=$("$bin" run -test -config "$cfg" 2>&1); then style="${pair#*:}"; break; fi
+        done
+        if [[ -n "$style" ]]; then
+            report ok "$label" "$base ($style form)"; warnings "$out"
+        else
+            report FAIL "$label" "$base (neither form accepted)" "$out"
+        fi
     done
-    if [[ -n "$style" ]]; then
-        report ok "$label" "xray-xhttp-mkcp ($style form)"
-    else
-        report FAIL "$label" "xray-xhttp-mkcp (neither form accepted)" "$out"
-    fi
 }
 
 # ── sing-box ──────────────────────────────────────────────────────────────────
@@ -150,7 +170,7 @@ validate_singbox() {
                                         outbounds: [{type: "direct", tag: "direct"}, $o]}' > "$cfg"
         fi
         if out=$("$bin" check -c "$cfg" 2>&1); then
-            report ok "$label" "$name"
+            report ok "$label" "$name"; warnings "$out"
         else
             report FAIL "$label" "$name" "$out"
         fi
@@ -172,7 +192,7 @@ validate_mihomo() {
             jq -n --argjson p "$frag" '{"mixed-port": 0, proxies: [$p], rules: ["MATCH,DIRECT"]}'
         fi > "$dir/config.yaml"
         if out=$("$bin" -t -d "$dir" -f "$dir/config.yaml" 2>&1); then
-            report ok "$label" "$name"
+            report ok "$label" "$name"; warnings "$out"
         else
             report FAIL "$label" "$name" "$out"
         fi

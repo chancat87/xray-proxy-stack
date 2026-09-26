@@ -62,7 +62,7 @@ jobs:
       - name: tests/core-validate.sh with pinned cores (Debian 13 container)
         run: |
           docker run --rm -v "$PWD:/src:ro" \
-            -e XRAY_STABLE=v26.3.27 -e XRAY_PREVIEW=v26.9.9 -e SINGBOX=1.14.0 -e MIHOMO=v1.19.30 \
+            -e XRAY_STABLE=v26.3.27 -e XRAY_PREVIEW=v26.9.9 -e SINGBOX=1.14.2 -e SINGBOX_PREVIEW=1.15.0-alpha.8 -e MIHOMO=v1.19.31 \
             debian:13 bash -c '
             set -euo pipefail
             apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq curl jq unzip openssl ca-certificates >/dev/null
@@ -72,13 +72,18 @@ jobs:
               curl -fsSL -o /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${tag}/Xray-linux-64.zip"
               unzip -qo /tmp/xray.zip xray geoip.dat geosite.dat -d "/opt/cores/xray-$ch"
             done
-            curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX}/sing-box-${SINGBOX}-linux-amd64.tar.gz" | tar xz -C /tmp
-            install -m 755 "/tmp/sing-box-${SINGBOX}-linux-amd64/sing-box" /opt/cores/sing-box
+            for v in "$SINGBOX" "$SINGBOX_PREVIEW"; do
+              curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${v}/sing-box-${v}-linux-amd64.tar.gz" | tar xz -C /tmp
+              install -m 755 "/tmp/sing-box-${v}-linux-amd64/sing-box" "/opt/cores/sing-box-${v}"
+            done
             curl -fsSL "https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO}/mihomo-linux-amd64-compatible-${MIHOMO}.gz" | gunzip > /opt/cores/mihomo
             chmod 755 /opt/cores/mihomo
             cp -a /src /w && cd /w
             XRAY_BINS="/opt/cores/xray-stable/xray /opt/cores/xray-preview/xray" \
-            SINGBOX_BIN=/opt/cores/sing-box MIHOMO_BIN=/opt/cores/mihomo \
+            SINGBOX_BIN="/opt/cores/sing-box-${SINGBOX}" MIHOMO_BIN=/opt/cores/mihomo \
+              bash tests/core-validate.sh
+            # the preview channel the installer offers for sing-box (the newest pre-release)
+            XRAY_BINS=" " SINGBOX_BIN="/opt/cores/sing-box-${SINGBOX_PREVIEW}" MIHOMO_BIN=/nonexistent \
               bash tests/core-validate.sh'
 
   integration:

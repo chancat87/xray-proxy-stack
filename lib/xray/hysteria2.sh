@@ -22,6 +22,7 @@ XHY2_CFG="$CFG_DIR/xray/hysteria2.json"
 XHY2_CERT_DIR="$CFG_DIR/xray/certs"
 XHY2_DEFAULT_PORT=8443
 XHY2_MIN_CORE="26.3.27"          # first Xray with the Hysteria2 inbound
+XHY2_BBR_MIN_CORE="26.4.13"      # first Xray with finalmask quicParams.bbrProfile
 XHY2_GECKO_PACKET_SIZE="512-1200"
 
 # ── Node store ────────────────────────────────────────────────────────────────
@@ -52,9 +53,9 @@ _xhy2_show_node_list() {
 }
 
 # ── Core version gate ─────────────────────────────────────────────────────────
-_xhy2_core_ok() {
-    local v; v=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1 {print $2}')
-    [[ -n "$v" ]] && [[ "$(printf '%s\n%s\n' "$XHY2_MIN_CORE" "$v" | sort -V | head -1)" == "$XHY2_MIN_CORE" ]]
+_xhy2_core_ok() {   # [minimum version, default XHY2_MIN_CORE]
+    local min="${1:-$XHY2_MIN_CORE}" v; v=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1 {print $2}')
+    [[ -n "$v" ]] && [[ "$(printf '%s\n%s\n' "$min" "$v" | sort -V | head -1)" == "$min" ]]
 }
 
 # ── TLS: a real domain certificate, or a self-signed one ─────────────────────
@@ -78,16 +79,13 @@ _xhy2_resolve_tls() {
     printf '%s\t%s\t%s\t1\n' "$crt" "$key" "$sni"
 }
 
-_xhy2_cert_sha256() {
-    openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null | awk -F= '{print $2}'
-}
-
 # ── Build inbound ─────────────────────────────────────────────────────────────
 _xhy2_build_inbound() {
     local n="$1"
     jq -n --argjson n "$n" --arg gecko "$XHY2_GECKO_PACKET_SIZE" '
       ($n.obfs_pass // "") as $obfs
       | ($n.obfs_type // "salamander") as $otype
+      | ($n.bbr_profile // "") as $bbr
       | {
           tag: $n.tag,
           listen: ($n.listen_addr // "0.0.0.0"),
@@ -102,10 +100,13 @@ _xhy2_build_inbound() {
               alpn: ["h3"],
               certificates: [ { certificateFile: $n.cert_path, keyFile: $n.key_path } ]
             }
-          } + (if $obfs == "" then {} else
-                 { finalmask: { udp: [ { type: "salamander",
-                     settings: ({ password: $obfs }
-                                + (if $otype == "gecko" then { packetSize: $gecko } else {} end)) } ] } }
+          } + (if $obfs == "" and $bbr == "" then {} else
+                 { finalmask: ((if $obfs == "" then {} else
+                     { udp: [ { type: "salamander",
+                       settings: ({ password: $obfs }
+                                  + (if $otype == "gecko" then { packetSize: $gecko } else {} end)) } ] } end)
+                   # the BBR profile the server sends with (Xray v26.4.13+)
+                   + (if $bbr == "" then {} else { quicParams: { bbrProfile: $bbr } } end)) }
                end)),
           sniffing: { enabled: true, destOverride: ["http", "tls", "quic"] }
         }'
@@ -129,16 +130,12 @@ _xhy2_apply_all() {
 # _xhy2_share_uri <node_json> <host> → hysteria2:// link (also used by psm node export)
 _xhy2_share_uri() {
     local n="$1" host="$2"
-    local tag pass port sni insec obfs otype pin q
+    local tag pass port sni insec obfs otype q
     tag=$(echo "$n"   | jq -r '.tag');      pass=$(echo "$n"  | jq -r '.password')
     port=$(echo "$n"  | jq -r '.port');     sni=$(echo "$n"   | jq -r '.sni')
     insec=$(echo "$n" | jq -r '.insecure | if . == true then 1 elif . == false then 0 else . end')
     obfs=$(echo "$n"  | jq -r '.obfs_pass // ""'); otype=$(echo "$n" | jq -r '.obfs_type // "salamander"')
-    q="insecure=${insec}&sni=${sni}"
-    if [[ "$insec" == "1" ]]; then
-        pin=$(_xhy2_cert_sha256 "$(echo "$n" | jq -r '.cert_path')")
-        [[ -n "$pin" ]] && q="${q}&pinSHA256=$(url_encode "$pin")"
-    fi
+    q="insecure=${insec}&sni=${sni}$(psm_pin_q "$n" pinSHA256)"
     [[ -n "$obfs" ]] && q="${q}&obfs=${otype}&obfs-password=$(url_encode "$obfs")"
     local hop; hop=$(echo "$n" | jq -r '.hop_ports // ""')
     printf 'hysteria2://%s@%s:%s?%s#PSM-%s\n' "$(url_encode "$pass")" "$host" "${port}${hop:+,$hop}" "$q" "$tag"
@@ -182,16 +179,21 @@ xhy2_add_node() {
         [[ "$oc" == "2" ]] && obfs_type="gecko"
     fi
 
+    # BBR 配置档（finalmask quicParams.bbrProfile，Xray v26.4.13+）
+    local bbr_profile=""
+    _xhy2_core_ok "$XHY2_BBR_MIN_CORE" && ask_hy2_bbr_profile bbr_profile
+
     local hop_ports=""
     source "$LIB_DIR/hop.sh"; ask_hy2_hop_ports hop_ports "$port" "$tag"
 
     local node
     node=$(jq -n --arg hop "$hop_ports" --arg tag "$tag" --argjson port "$port" --arg pass "$password" \
         --arg domain "$domain" --arg sni "$sni" --arg cert "$cert" --arg key "$key" \
-        --argjson insec "$insecure" --arg obfs "$obfs_pass" --arg otype "$obfs_type" \
+        --argjson insec "$insecure" --arg obfs "$obfs_pass" --arg otype "$obfs_type" --arg bbr "$bbr_profile" \
         '{tag:$tag, port:$port, password:$pass, domain:$domain, sni:$sni,
           cert_path:$cert, key_path:$key, insecure:$insec, listen_addr:"0.0.0.0", obfs_pass:$obfs}
          | (if $obfs != "" then .obfs_type = $otype else . end)
+         | (if $bbr != "" then .bbr_profile = $bbr else . end)
          | (if $hop != "" then .hop_ports = $hop else . end)')
     local prev; prev=$(_xhy2_load)
     _xhy2_upsert "$node"

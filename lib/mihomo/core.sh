@@ -14,7 +14,7 @@ MH_SERVICE="/etc/systemd/system/mihomo.service"
 MH_ENV="$MH_CFG_DIR/psm.env"          # SAFE_PATHS 等运行时环境，见 _mh_sync_safe_paths
 MH_STORE_DIR="$CFG_DIR/mihomo"        # 各协议节点存储（唯一事实源）
 MH_RELEASES="https://github.com/MetaCubeX/mihomo/releases"
-MH_STABLE_FALLBACK="v1.19.30"   # API 不可达时的兜底，必须是真实存在的稳定 tag
+MH_STABLE_FALLBACK="v1.19.31"   # API 不可达时的兜底，必须是真实存在的稳定 tag
 
 # ── Install ───────────────────────────────────────────────────────────────────
 mh_install() {

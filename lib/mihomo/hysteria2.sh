@@ -62,11 +62,13 @@ _mh_hy2_build_listener_base() {
     local obfs;  obfs=$(echo "$node_json"  | jq -r '.obfs_pass // ""')
     # salamander（默认，老节点没有这个字段）或 gecko（mihomo 1.19.26+）
     local otype; otype=$(echo "$node_json" | jq -r '.obfs_type // "salamander"')
+    # BBR 配置档（mihomo 1.19.24+）：conservative / standard / aggressive；未设置不写
+    local bbr;   bbr=$(echo "$node_json"   | jq -r '.bbr_profile // ""')
 
     jq -n \
         --arg tag "$tag" --argjson p "$port" --arg pass "$pass" \
         --arg sni "$sni" --arg cert "$cert" --arg key "$key" \
-        --arg masq "$masq" --arg obfs "$obfs" --arg otype "$otype" \
+        --arg masq "$masq" --arg obfs "$obfs" --arg otype "$otype" --arg bbr "$bbr" \
     '{
         name: $tag,
         type: "hysteria2",
@@ -78,6 +80,7 @@ _mh_hy2_build_listener_base() {
         "private-key": $key
     }
     + (if $obfs != "" then { obfs: $otype, "obfs-password": $obfs } else {} end)
+    + (if $bbr  != "" then { "bbr-profile": $bbr } else {} end)
     + (if $masq != "" then { masquerade: $masq } else {} end)'
 }
 
@@ -124,7 +127,8 @@ _mh_hy2_uri() {
     local hop; hop=$(echo "$node" | jq -r '.hop_ports // ""')
 
     local ip; ip=$(get_ipv4)
-    local uri="hysteria2://${pass}@${ip}:${port}${hop:+,$hop}?insecure=${insec}&sni=${sni}"
+    local uri
+    uri="hysteria2://${pass}@${ip}:${port}${hop:+,$hop}?insecure=${insec}&sni=${sni}$(psm_pin_q "$node" pinSHA256)"
     [[ -n "$obfs" ]] && uri="${uri}&obfs=${otype}&obfs-password=${obfs}"
     uri="${uri}#PSM-${tag}"
 
@@ -147,6 +151,9 @@ _mh_hy2_uri() {
     [[ -n "$obfs" ]] && obfs_yaml=$'\n    obfs: '"${otype}"$'\n    obfs-password: '"${obfs}"
     [[ -n "$hop" ]] && obfs_yaml="${obfs_yaml}"$'\n    ports: '"${hop}"
     echo -e "\n${BOLD}$(t mh.hy2.clash_label):${NC}"
+    # a self-signed certificate: mihomo pins it (fingerprint) — see psm_node_pins
+    local pin_yaml; pin_yaml=$(psm_pin_yaml "$node")
+    [[ -n "$pin_yaml" ]] && pin_yaml=$'\n'"$pin_yaml"
     cat <<EOF
 proxies:
   - name: PSM-${tag}
@@ -155,7 +162,7 @@ proxies:
     port: ${port}
     password: "${pass}"
     sni: ${sni}${obfs_yaml}
-    skip-cert-verify: $([[ "$insec" == "1" ]] && echo true || echo false)
+    skip-cert-verify: $([[ "$insec" == "1" ]] && echo true || echo false)${pin_yaml}
 EOF
 }
 
@@ -207,6 +214,12 @@ mh_hy2_add_node() {
         [[ "$oc" == "2" ]] && obfs_type="gecko"
     fi
 
+    # BBR 配置档（mihomo 1.19.24+）：只在不限速、走 BBR 时有意义
+    local bbr_profile=""
+    if (( up == 0 && down == 0 )) && _mh_version_ge "$(_mh_installed_version)" "1.19.24"; then
+        ask_hy2_bbr_profile bbr_profile
+    fi
+
     local hop_ports=""
     source "$LIB_DIR/hop.sh"; ask_hy2_hop_ports hop_ports "$port" "$tag"
 
@@ -216,11 +229,12 @@ mh_hy2_add_node() {
         --arg domain "$domain" --arg sni "$sni" \
         --arg cert "$cert_path" --arg key "$key_path" --argjson insec "$insecure" \
         --argjson up "$up" --argjson down "$down" --arg masq "$masq" --arg obfs "$obfs_pass" \
-        --arg otype "$obfs_type" \
+        --arg otype "$obfs_type" --arg bbr "$bbr_profile" \
         '{tag:$tag, port:$port, password:$pass, domain:$domain, sni:$sni,
           cert_path:$cert, key_path:$key, insecure:$insec, up:$up, down:$down,
           masquerade:$masq, obfs_pass:$obfs}
          | (if $obfs != "" then .obfs_type = $otype else . end)
+         | (if $bbr != "" then .bbr_profile = $bbr else . end)
          | (if $hop != "" then .hop_ports = $hop else . end)')
 
     local _prev_store; _prev_store=$(_mh_hy2_load)

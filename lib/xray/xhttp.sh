@@ -75,28 +75,53 @@ _show_node_list() {
     done
 }
 
-# mKCP 的 seed / 伪装头写法在 Xray 里改过两次，且互不兼容（均用真实内核实测）：
-#   v26.3.27：kcpSettings.seed/header 被拒，只认 finalmask 的 mkcp-aes128gcm / header-* / mkcp-original
-#   v26.9.9 ：kcpSettings.seed/header 又能用了，mkcp-aes128gcm 反倒成了「unknown config id」
-# 中间版本的边界没法逐个确认，所以直接问本机装的 Xray：旧写法过得了 -test 就用旧写法，
-# 否则用 finalmask。每个进程只探测一次；没装 Xray（测试、离线生成）时按旧写法。
-_xray_kcp_legacy_ok() {
-    if [[ -z "${_XRAY_KCP_LEGACY:-}" ]]; then
-        _XRAY_KCP_LEGACY=1
+# mKCP 的 seed / 伪装头在 Xray 里有三种写法（均用真实内核实测，Xray v25.12.8 / v26.3.27 /
+# v26.9.9 互为客户端和服务端）：
+#   v26.3 之前：kcpSettings.seed / header                         —— 经典线上格式
+#   v26.3.27  ：finalmask 的 mkcp-aes128gcm / mkcp-original / header-*（kcpSettings.seed 被拒）
+#   v26.6 起  ：finalmask 的 mkcp-legacy {value | header}（mkcp-aes128gcm 成了 unknown config id）
+# 两种 finalmask 写法与经典格式在线上互通：v25 客户端的 kcpSettings.seed、v2rayN 7.25 生成的
+# mkcp-legacy 都连得上（v25 这类不认 finalmask 的 Xray 会忽略这个键，所以先用一个不存在的
+# mask 类型确认它真的解析 finalmask）。v26.9.9 虽然又接受 kcpSettings.seed，但那已经和谁都不互通（v25 客户端、
+# v2rayN 都连不上，只有同样这么写的 v26.9.9 能连）——按旧写法优先的做法让 PSM 在 v26.9.9 上建出
+# 的 mKCP 节点谁都用不了。所以问本机的 Xray：认 mkcp-legacy 就用它，其次 mkcp-aes128gcm，都不认
+# 才用 kcpSettings。每个进程只探测一次；没装 Xray（测试、离线生成）时按稳定版的 finalmask。
+_xray_kcp_probe() {   # <dir> <streamSettings fragment>: does the installed Xray take it
+    jq -n --argjson fm "$2" '{inbounds: [{port: 1, protocol: "vless", settings: {clients: [], decryption: "none"},
+             streamSettings: ({network: "kcp", security: "none"} + $fm)}], outbounds: [{protocol: "freedom"}]}' > "$1/probe.json"
+    "$XRAY_BIN" run -test -config "$1/probe.json" &>/dev/null
+}
+# Before v26.6.22 ("Finalmask: Fix unexpected order") Xray applied the finalmask
+# masks last to first: the wire format of seed + header is [header, cipher]
+# there, [cipher, header] after (as v2rayN writes it). Measured: v26.3.27 with
+# [cipher, header] reaches neither a v25 client nor v26.9.9's mkcp-legacy, and
+# with [header, cipher] both.
+_xray_masks_reversed() {
+    local v; v=$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1 {print $2}')
+    [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    [[ "$(printf '26.6.22\n%s\n' "$v" | sort -V | head -1)" != 26.6.22 ]]
+}
+
+_xray_kcp_form() {   # → mkcp-legacy | finalmask | legacy
+    if [[ -z "${_XRAY_KCP_FORM:-}" ]]; then
+        _XRAY_KCP_FORM=finalmask
         if [[ -x "${XRAY_BIN:-}" ]]; then
             # Xray picks the config format from the file extension: a bare mktemp
-            # name is rejected on every version, which made this probe always
-            # answer "finalmask" (right on v26.3.27 by luck, wrong on v26.9.9).
+            # name is rejected on every version (probe.json, not a temp name).
             local d; d=$(mktemp -d)
-            jq -n '{inbounds: [{port: 1, protocol: "vless", settings: {clients: [], decryption: "none"},
-                     streamSettings: {network: "kcp", security: "none",
-                                      kcpSettings: {seed: "probe", header: {type: "srtp"}}}}],
-                    outbounds: [{protocol: "freedom"}]}' > "$d/probe.json"
-            "$XRAY_BIN" run -test -config "$d/probe.json" &>/dev/null || _XRAY_KCP_LEGACY=0
+            # an Xray without finalmask ignores the key and passes any of these
+            # (v25.12.8 did): a mask type that does not exist tells them apart
+            if _xray_kcp_probe "$d" '{"finalmask": {"udp": [{"type": "psm-no-such-mask"}]}}'; then
+                _XRAY_KCP_FORM=legacy
+            elif _xray_kcp_probe "$d" '{"finalmask": {"udp": [{"type": "mkcp-legacy", "settings": {"value": "probe"}}]}}'; then
+                _XRAY_KCP_FORM=mkcp-legacy
+            elif ! _xray_kcp_probe "$d" '{"finalmask": {"udp": [{"type": "mkcp-aes128gcm", "settings": {"password": "probe"}}]}}'; then
+                _XRAY_KCP_FORM=legacy
+            fi
             rm -rf "$d"
         fi
     fi
-    [[ "$_XRAY_KCP_LEGACY" == "1" ]]
+    printf '%s' "$_XRAY_KCP_FORM"
 }
 
 # ── Build inbound ─────────────────────────────────────────────────────────────
@@ -170,22 +195,36 @@ _xhttp_build_inbound() {
             local kcp_header; kcp_header=$(echo "$n" | jq -r '.kcp_header // "none"')
             local kcp_base='{ "mtu": 1350, "tti": 50, "uplinkCapacity": 5, "downlinkCapacity": 20,
                               "congestion": false, "readBufferSize": 2, "writeBufferSize": 2 }'
-            if _xray_kcp_legacy_ok; then
-                stream_json=$(jq -n --arg seed "$kcp_seed" --arg header "$kcp_header" --argjson base "$kcp_base" \
-                    '{ "network": "kcp", "security": "none",
-                       "kcpSettings": ($base + { "seed": $seed, "header": { "type": $header } }) }')
-            else
-                # finalmask 写法：数组第一个是最内层。旧 mKCP 的顺序是先加密（有 seed
-                # 用 AES-128-GCM，没有则是默认的 xor 混淆 = mkcp-original）再套伪装头；
-                # 没 seed 时必须写 mkcp-original，否则与老客户端的默认混淆对不上。
-                stream_json=$(jq -n --arg seed "$kcp_seed" --arg header "$kcp_header" --argjson base "$kcp_base" \
-                    '{ "network": "kcp", "security": "none", "kcpSettings": $base,
-                       "finalmask": { "udp": (
-                         [ if $seed != "" then { "type": "mkcp-aes128gcm", "settings": { "password": $seed } }
-                           else { "type": "mkcp-original" } end ]
-                         + (if $header == "none" or $header == "" then []
-                            else [{ "type": ("header-" + ($header | sub("-video$"; ""))) }] end)) } }')
-            fi
+            case "$(_xray_kcp_form)" in
+                legacy)
+                    stream_json=$(jq -n --arg seed "$kcp_seed" --arg header "$kcp_header" --argjson base "$kcp_base" \
+                        '{ "network": "kcp", "security": "none",
+                           "kcpSettings": ($base + { "seed": $seed, "header": { "type": $header } }) }') ;;
+                finalmask)
+                    # finalmask 写法（v26.3–v26.5，都早于 v26.6.22 的顺序修正，所以伪装头
+                    # 写在前面，见 _xray_masks_reversed）：加密层有 seed 用 AES-128-GCM，没有
+                    # 则是默认的 xor 混淆 = mkcp-original——没 seed 时也必须写上，否则与老
+                    # 客户端的默认混淆对不上。
+                    stream_json=$(jq -n --arg seed "$kcp_seed" --arg header "$kcp_header" --argjson base "$kcp_base" \
+                        '{ "network": "kcp", "security": "none", "kcpSettings": $base,
+                           "finalmask": { "udp": (
+                             (if $header == "none" or $header == "" then []
+                              else [{ "type": ("header-" + ($header | sub("-video$"; ""))) }] end)
+                             + [ if $seed != "" then { "type": "mkcp-aes128gcm", "settings": { "password": $seed } }
+                                 else { "type": "mkcp-original" } end ]) } }') ;;
+                *)
+                    # mkcp-legacy: the same two layers, each as one mkcp-legacy mask — the
+                    # seed as value (none = the default xor obfuscation), then the header;
+                    # header first on v26.6.1, which still applied the masks backwards
+                    local rev=false; _xray_masks_reversed && rev=true
+                    stream_json=$(jq -n --arg seed "$kcp_seed" --arg header "$kcp_header" --argjson base "$kcp_base" \
+                        --argjson rev "$rev" \
+                        '([ { "type": "mkcp-legacy", "settings": (if $seed != "" then { "value": $seed } else {} end) } ]
+                          + (if $header == "none" or $header == "" then []
+                             else [{ "type": "mkcp-legacy", "settings": { "header": ($header | sub("-video$"; "")) } }] end)) as $m
+                         | { "network": "kcp", "security": "none", "kcpSettings": $base,
+                             "finalmask": { "udp": (if $rev then ($m | reverse) else $m end) } }') ;;
+            esac
             ;;
         reality-layer)
             local priv_key; priv_key=$(echo "$n" | jq -r '.private_key // empty')
@@ -409,7 +448,10 @@ xhttp_add_node() {
         nginx_setup_http_camouflage "$domain" || fallback_enabled=false
     fi
 
-    local enc_pair; enc_pair=$(xray_ask_vlessenc) || return 1
+    # mKCP has no TLS: Xray v26.7.7+ clients refuse its VLESS unless encrypted
+    local enc_default=N
+    if [[ "$mode" == "mkcp" ]]; then log_info "$(t common.vlessenc.kcp_why)"; enc_default=Y; fi
+    local enc_pair; enc_pair=$(xray_ask_vlessenc "$enc_default") || return 1
 
     local node
     node=$(jq -n \

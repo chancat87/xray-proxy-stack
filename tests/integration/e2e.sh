@@ -127,6 +127,124 @@ for tag in "${ADDED[@]}"; do
 done
 kill $CPID 2>/dev/null
 
+sec "self-signed nodes: every client pins the certificate PSM signed"
+# No test CA here: these nodes get PSM's own self-signed certificate, which no
+# client trusts. Xray refuses allowInsecure since 2026-06-01, so the links
+# carry the certificate's SHA-256 (pcs / pinSHA256); PSM's sing-box and mihomo
+# exports pin it too. A wrong pin must fail: that proves it is checked, not
+# skipped.
+source tests/integration/xray-link.sh
+add sing-box trojan    p-st   --port 35001
+add sing-box vless     p-svt  --port 35002 --transport tcp
+add sing-box vless     p-svw  --port 35003 --transport ws
+add sing-box vmess     p-svm  --port 35004
+add sing-box hysteria2 p-shy  --port 35005
+add sing-box anytls    p-sat  --port 35006
+add sing-box tuic      p-stu  --port 35007
+add mihomo trojan      p-mt   --port 35011
+add mihomo vless       p-mvg  --port 35012 --transport grpc
+add mihomo vmess       p-mvm  --port 35013
+add mihomo hysteria2   p-mhy  --port 35014 --obfs-pass e2e-obfs
+add mihomo anytls      p-mat  --port 35015
+add mihomo tuic        p-mtu  --port 35016
+X=/root/xray-client; mkdir -p "$X"
+if [[ ! -x "$X/xray" ]]; then   # the Xray v2rayN ships today, whatever the server runs
+    curl -fsSL --retry 3 -o "$X/x.zip" https://github.com/XTLS/Xray-core/releases/download/v26.9.9/Xray-linux-64.zip \
+        && unzip -qo "$X/x.zip" xray -d "$X"
+fi
+chk "Xray v26.9.9 as the client" "$X/xray" version
+through() {   # through <socks port> → HTTP code of generate_204 through it
+    curl -s -o /dev/null -w '%{http_code}' --max-time 15 -x "socks5h://127.0.0.1:$1" https://www.gstatic.com/generate_204
+}
+xray_try() {   # xray_try <link> <port>: sets code
+    xray_link_client "$1" "$2" > "$X/c-$2.json" || { code=unsupported; return; }
+    "$X/xray" run -config "$X/c-$2.json" > "$X/c-$2.log" 2>&1 & local xp=$!; sleep 2
+    code=$(through "$2"); [[ "$code" == 204 ]] || { sleep 2; code=$(through "$2"); }
+    kill $xp 2>/dev/null; wait $xp 2>/dev/null
+}
+i=0
+for tag in p-st p-svt p-svw p-svm p-shy p-mt p-mvg p-mvm p-mhy; do
+    i=$((i + 1))
+    link=$(psm node export "$tag" --server 127.0.0.1 2>/dev/null)
+    case "$tag" in p-svm|p-mvm) pin=$(printf '%s' "${link#vmess://}" | base64 -d | jq -r '.pcs // ""') ;;
+                   *) pin=$(sed -nE 's/.*[?&](pcs|pinSHA256)=([0-9a-f]{64}).*/\2/p' <<<"$link") ;; esac
+    [[ ${#pin} == 64 ]] || { bad "$tag: its link carries no certificate pin: $link"; continue; }
+    xray_try "$link" $((18100 + i))
+    [[ "$code" == 204 ]] && ok "$tag: Xray v26.9.9 with the share link, certificate pinned: HTTP 204" \
+        || { bad "$tag: Xray with the share link: HTTP $code"; tail -3 "$X/c-$((18100 + i)).log" | sed 's/^/       /'; }
+done
+link=$(psm node export p-st --server 127.0.0.1 2>/dev/null)
+pin=$(sed -nE 's/.*pcs=([0-9a-f]{64}).*/\1/p' <<<"$link")
+[[ "${pin:0:1}" == 0 ]] && flip=1 || flip=0
+xray_try "${link/pcs=$pin/pcs=$flip${pin:1}}" 18150
+[[ "$code" != 204 ]] && ok "a wrong pcs is refused by Xray (HTTP $code)" || bad "Xray accepted a wrong pcs"
+# without the pin the node cannot be used from Xray at all (what the old links did)
+xray_try "$(sed -E 's/&pcs=[0-9a-f]{64}//' <<<"$link")" 18151
+[[ "$code" != 204 ]] && ok "the same link without pcs fails in Xray (HTTP $code): why the pin is needed" || bad "Xray connected to a self-signed node without a pin"
+
+# sing-box: PSM's own outbound export, certificate_public_key_sha256 instead of insecure
+sb_try() {   # sb_try <outbound json> <port>: sets code
+    jq -n --argjson o "$1" --argjson p "$2" '{log: {level: "warn"}, inbounds: [{type: "mixed", listen: "127.0.0.1", listen_port: $p}],
+        outbounds: [($o + {tag: "proxy"})], route: {final: "proxy"}}' > "$X/s-$2.json"
+    /usr/local/bin/sing-box run -c "$X/s-$2.json" > "$X/s-$2.log" 2>&1 & local sp=$!; sleep 2
+    code=$(through "$2"); [[ "$code" == 204 ]] || { sleep 2; code=$(through "$2"); }
+    kill $sp 2>/dev/null; wait $sp 2>/dev/null
+}
+i=0
+for tag in p-st p-svw p-svm p-shy p-sat p-stu p-mt p-mvg p-mhy p-mat p-mtu; do
+    i=$((i + 1))
+    ob=$(psm node export "$tag" --format singbox --server 127.0.0.1 2>/dev/null)
+    if ! jq -e '(.tls.certificate_public_key_sha256 | length) == 1 and (.tls.insecure | not)' <<<"$ob" >/dev/null 2>&1; then
+        bad "$tag: sing-box export without a pinned key: $ob"; continue
+    fi
+    sb_try "$ob" $((18200 + i))
+    [[ "$code" == 204 ]] && ok "$tag: sing-box with PSM's outbound, public key pinned: HTTP 204" \
+        || { bad "$tag: sing-box with PSM's outbound: HTTP $code"; tail -3 "$X/s-$((18200 + i)).log" | sed 's/^/       /'; }
+done
+ob=$(psm node export p-st --format singbox --server 127.0.0.1 2>/dev/null)
+sb_try "$(jq -c '.tls.certificate_public_key_sha256 = ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="]' <<<"$ob")" 18250
+[[ "$code" != 204 ]] && ok "a wrong key pin is refused by sing-box (HTTP $code)" || bad "sing-box accepted a wrong key pin"
+
+# mihomo: PSM's Clash export keeps skip-cert-verify (for Stash) and adds fingerprint, which mihomo checks regardless
+mh_try() {   # mh_try <proxy json> <port>: sets code
+    mkdir -p "$X/m-$2"
+    jq -n --argjson p "$1" --argjson port "$2" '{"mixed-port": $port, "bind-address": "127.0.0.1", "log-level": "warning",
+        proxies: [($p + {name: "P"})], rules: ["MATCH,P"]}' > "$X/m-$2/config.yaml"
+    /usr/local/bin/mihomo -d "$X/m-$2" -f "$X/m-$2/config.yaml" > "$X/m-$2/log" 2>&1 & local mp=$!; sleep 2
+    code=$(through "$2"); [[ "$code" == 204 ]] || { sleep 2; code=$(through "$2"); }
+    kill $mp 2>/dev/null; wait $mp 2>/dev/null
+}
+i=0
+for tag in p-st p-svt p-svm p-shy p-sat p-stu p-mt p-mvg p-mvm p-mhy p-mat p-mtu; do
+    i=$((i + 1))
+    px=$(psm node export "$tag" --format clash --server 127.0.0.1 2>/dev/null)
+    if ! jq -e '(.fingerprint | test("^[0-9a-f]{64}$")) and ."skip-cert-verify" == true' <<<"$px" >/dev/null 2>&1; then
+        bad "$tag: Clash export without a fingerprint: $px"; continue
+    fi
+    mh_try "$px" $((18300 + i))
+    [[ "$code" == 204 ]] && ok "$tag: mihomo with PSM's Clash proxy, fingerprint checked: HTTP 204" \
+        || { bad "$tag: mihomo with PSM's Clash proxy: HTTP $code"; tail -3 "$X/m-$((18300 + i))/log" | sed 's/^/       /'; }
+done
+px=$(psm node export p-mt --format clash --server 127.0.0.1 2>/dev/null)
+mh_try "$(jq -c '.fingerprint = ("0" * 64)' <<<"$px")" 18350
+[[ "$code" != 204 ]] && ok "a wrong fingerprint is refused by mihomo even with skip-cert-verify (HTTP $code)" || bad "mihomo accepted a wrong fingerprint"
+# mihomo also reads the pin from the links (pcs → fingerprint, pinSHA256, hpkp)
+i=0
+for tag in p-st p-svt p-shy p-sat p-mt p-mvg p-mhy p-mat; do
+    i=$((i + 1)); d="$X/l-$i"; mkdir -p "$d"
+    psm node export "$tag" --server 127.0.0.1 2>/dev/null | openssl base64 -A > "$d/sub.txt"
+    printf 'mixed-port: %s\nbind-address: 127.0.0.1\nlog-level: warning\nproxy-providers:\n  p: {type: file, path: ./sub.txt}\nproxy-groups:\n  - {name: P, type: select, use: [p]}\nrules:\n  - MATCH,P\n' \
+        $((18400 + i)) > "$d/config.yaml"
+    /usr/local/bin/mihomo -d "$d" -f "$d/config.yaml" > "$d/log" 2>&1 & MP=$!; sleep 3
+    code=$(through $((18400 + i))); [[ "$code" == 204 ]] || { sleep 2; code=$(through $((18400 + i))); }
+    kill $MP 2>/dev/null; wait $MP 2>/dev/null
+    [[ "$code" == 204 ]] && ok "$tag: mihomo with the share link (pin read from it): HTTP 204" \
+        || { bad "$tag: mihomo with the share link: HTTP $code"; tail -3 "$d/log" | sed 's/^/       /'; }
+done
+for tag in p-st p-svt p-svw p-svm p-shy p-sat p-stu p-mt p-mvg p-mvm p-mhy p-mat p-mtu; do
+    bash manager.sh node delete "$tag" --yes >/dev/null 2>&1 || bad "delete $tag"
+done
+
 sec "cores run unprivileged (psm-core)"
 for c in xray sing-box mihomo; do
     # by owner, not the first match: the suite's own mihomo clients run as root
@@ -232,6 +350,62 @@ u=$(for p in $(pgrep -x sing-box); do stat -c %U "/proc/$p" 2>/dev/null; done | 
 chk "hop rule restored" bash -c "iptables -t nat -S PREROUTING | grep -q 'psm-hop:e-hop2'"
 [[ -s /root/doc2.err ]] && sed 's/^/       /' /root/doc2.err | tail -8
 chk "delete e-hop2" bash manager.sh node delete sing-box hysteria2 e-hop2 --yes
+
+sec "mKCP with a disguise header, from v2rayN's config and an older core's"
+# The wire format of seed + header is the classic one of Xray v25 (kcpSettings)
+# in every form PSM writes: finalmask [header, cipher] before v26.6.22, which
+# applied masks backwards, and mkcp-legacy [cipher, header] after (v2rayN's
+# form). Xray v26.9.9 takes kcpSettings.seed again, but that form reaches no
+# other client. Clients: Xray v26.9.9 from the link (mkcp-legacy, as v2rayN)
+# and Xray v25.12.8 with the classic kcpSettings.
+X25=/root/xray-v25; mkdir -p "$X25"
+[[ -x "$X25/xray" ]] || { curl -fsSL --retry 3 -o "$X25/x.zip" https://github.com/XTLS/Xray-core/releases/download/v25.12.8/Xray-linux-64.zip && unzip -qo "$X25/x.zip" xray -d "$X25"; }
+kcp_v25() {   # kcp_v25 <tag> <node port> <socks port>: the classic kcpSettings client, Xray v25.12.8 (sets code)
+    local n; n=$(jq -c --arg t "$1" '.[] | select(.tag == $t)' config/xray/xhttp.json)
+    jq -n --argjson n "$n" --argjson np "$2" --argjson p "$3" '{log: {loglevel: "warning"},
+        inbounds: [{listen: "127.0.0.1", port: $p, protocol: "socks"}],
+        outbounds: [{protocol: "vless", settings: {vnext: [{address: "127.0.0.1", port: $np,
+                       users: [{id: $n.uuid, encryption: ($n.vless_encryption // "none")}]}]},
+                     streamSettings: {network: "kcp", kcpSettings: {seed: $n.kcp_seed, header: {type: $n.kcp_header}}}}]}' > "$X25/c.json"
+    "$X25/xray" run -config "$X25/c.json" > "$X25/c.log" 2>&1 & local xp=$!; sleep 2
+    code=$(through "$3"); [[ "$code" == 204 ]] || { sleep 2; code=$(through "$3"); }
+    kill $xp 2>/dev/null; wait $xp 2>/dev/null
+}
+kcp_both() {   # kcp_both <tag> <node port> <socks port>: both clients through the node
+    xray_try "$(psm node export xray xhttp "$1" --server 127.0.0.1 2>/dev/null)" "$3"
+    [[ "$code" == 204 ]] && ok "$1: Xray v26.9.9 as v2rayN writes it (mkcp-legacy): HTTP 204" || { bad "$1 from v26.9.9: HTTP $code"; tail -3 "$X/c-$3.log" | sed 's/^/       /'; }
+    kcp_v25 "$1" "$2" $(($3 + 1))
+    [[ "$code" == 204 ]] && ok "$1: Xray v25.12.8 (classic kcpSettings.seed/header): HTTP 204" || { bad "$1 from v25.12.8: HTTP $code"; tail -3 "$X25/c.log" | sed 's/^/       /'; }
+}
+xv=$(/usr/local/bin/xray version | awk 'NR==1 {print $2}')
+add xray xhttp e-kcp3 --port 31019 --mode mkcp --kcp-header srtp
+if [[ "$(printf '26.6.22\n%s\n' "$xv" | sort -V | head -1)" != 26.6.22 ]]; then
+    chk "on Xray $xv: the header before the cipher (it applies masks backwards)" jq -e \
+        '.inbounds[] | select(.tag == "e-kcp3") | [.streamSettings.finalmask.udp[].type] == ["header-srtp", "mkcp-aes128gcm"]' /usr/local/etc/xray/config.json
+fi
+kcp_both e-kcp3 31019 18510
+chk "delete e-kcp3" bash manager.sh node delete xray xhttp e-kcp3 --yes
+
+chk "Xray v26.9.9 installed over the stable one" bash -c \
+    "PSM_NO_WIZARD=1 PSM_XRAY_TAG=v26.9.9 bash -c 'source lib/xray/core.sh; xray_install' <<< \$'y\n0\n0\n0\n0\n' >/root/x9.log 2>&1; /usr/local/bin/xray version | grep -q '^Xray 26.9.9'"
+add xray xhttp e-kcp9 --port 31020 --mode mkcp --kcp-header srtp
+chk "on v26.9.9: finalmask mkcp-legacy, the seed then the srtp header" jq -e \
+    '.inbounds[] | select(.tag == "e-kcp9") | .streamSettings | (.kcpSettings.seed == null) and ([.finalmask.udp[].type] == ["mkcp-legacy", "mkcp-legacy"]) and (.finalmask.udp[1].settings.header == "srtp")' \
+    /usr/local/etc/xray/config.json
+klink=$(psm node export xray xhttp e-kcp9 --server 127.0.0.1 2>/dev/null)
+chk "its link: VLESS Encryption on, seed and header" bash -c "[[ '$klink' == *encryption=mlkem768x25519plus* && '$klink' == *seed=* && '$klink' == *headerType=srtp* ]]"
+kcp_both e-kcp9 31020 18512
+# the form PSM wrote here before: accepted by this Xray, reachable by no client
+jq '(.inbounds[] | select(.tag == "e-kcp9") | .streamSettings) |= (del(.finalmask) | .kcpSettings += {seed: "planted", header: {type: "srtp"}})' \
+    /usr/local/etc/xray/config.json > /root/x.planted && cat /root/x.planted > /usr/local/etc/xray/config.json
+bash -c 'source lib/common.sh; svc_restart xray' >/dev/null 2>&1; sleep 2
+bash manager.sh doctor --json > /root/doc-kcp.json 2>/dev/null
+chk "doctor: an mKCP node not in this Xray's form, fixable" jq -e '.checks[] | select(.id == "xray.kcp") | .status == "warning" and .fixable' /root/doc-kcp.json
+bash manager.sh doctor --fix --json > /root/doc-kcp2.json 2>/dev/null
+chk "doctor --fix rewrites it (ok on the re-check)" jq -e '.checks[] | select(.id == "xray.kcp") | .status == "ok"' /root/doc-kcp2.json
+kcp_v25 e-kcp9 31020 18514
+[[ "$code" == 204 ]] && ok "e-kcp9 after the fix: the v25.12.8 client again: HTTP 204" || bad "e-kcp9 after the fix: HTTP $code"
+chk "delete e-kcp9" bash manager.sh node delete xray xhttp e-kcp9 --yes
 
 echo; echo "=== RESULT: $PASS ok, $FAIL failed"
 for f in "${FAILS[@]}"; do echo "  - $f"; done

@@ -181,7 +181,7 @@ xray_install() {
 # test/restart is deferred: intermediate states would fail it).
 xray_rebuild_from_stores() {
     local entry fn
-    unset _XRAY_KCP_LEGACY          # the probe result belongs to the old binary
+    unset _XRAY_KCP_FORM            # the probe result belongs to the old binary
     PSM_XRAY_DEFER_RESTART=1
     for entry in reality:_reality_apply_all vision:_vision_apply_all \
                  xhttp:_xhttp_apply_all ss2022:_xss_apply_to_xray \
@@ -212,8 +212,9 @@ xray_vlessenc_gen() {
 }
 
 # Interactive: offer VLESS Encryption. Prints the pair, or nothing when declined.
+# $1: the default answer (Y for mKCP, which has no TLS; N otherwise).
 xray_ask_vlessenc() {
-    ask_yn "$(t common.vlessenc.ask)" N || return 0
+    ask_yn "$(t common.vlessenc.ask)" "${1:-N}" || return 0
     echo -e "  $(t common.vlessenc.auth1)" >&2
     echo -e "  $(t common.vlessenc.auth2)" >&2
     local c; read -rp "$(echo -e "${CYAN}$(t common.vlessenc.ask_auth)${NC}")" c

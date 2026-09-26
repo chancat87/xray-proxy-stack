@@ -139,8 +139,11 @@ _sb_vmess_uri() {
     payload=$(jq -nc \
         --arg ps "PSM-$tag" --arg add "$host" --arg port "$port" \
         --arg id "$uuid" --arg host_hdr "$sni" --arg path "$path" \
+        --arg ins "$insec" --arg pin "$(psm_pin_q "$node" pcs)" \
         '{v:"2", ps:$ps, add:$add, port:$port, id:$id, aid:"0", scy:"auto",
-          net:"ws", type:"none", host:$host_hdr, path:$path, tls:"tls", sni:$host_hdr}')
+          net:"ws", type:"none", host:$host_hdr, path:$path, tls:"tls", sni:$host_hdr}
+         + (if $ins == "1" then {insecure: "1"} else {} end)
+         + (if $pin == "" then {} else {pcs: ($pin | ltrimstr("&pcs="))} end)')
     uri="vmess://$(printf '%s' "$payload" | openssl base64 -A)"
 
     echo -e "\n${BOLD}${GREEN}── sing-box VMess: ${tag} ──${NC}"

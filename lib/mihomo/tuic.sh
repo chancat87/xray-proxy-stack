@@ -133,6 +133,9 @@ _mh_tuic_uri() {
     echo "$uri" | qrencode -t ANSIUTF8 2>/dev/null || true
 
     echo -e "\n${BOLD}$(t mh.tuic.clash_label):${NC}"
+    # a self-signed certificate: mihomo pins it (fingerprint) — see psm_node_pins
+    local pin_yaml; pin_yaml=$(psm_pin_yaml "$node")
+    [[ -n "$pin_yaml" ]] && pin_yaml=$'\n'"$pin_yaml"
     cat <<EOF
 proxies:
   - name: PSM-${tag}
@@ -145,7 +148,7 @@ proxies:
     alpn: [h3]
     congestion-controller: ${cc}
     udp-relay-mode: native
-    skip-cert-verify: $([[ "$insec" == "1" ]] && echo true || echo false)
+    skip-cert-verify: $([[ "$insec" == "1" ]] && echo true || echo false)${pin_yaml}
 EOF
 }
 

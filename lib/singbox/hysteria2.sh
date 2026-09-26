@@ -65,12 +65,14 @@ _sb_hy2_build_inbound_base() {
     # 混淆类型：salamander（默认，老节点没有这个字段）或 gecko（sing-box 1.14+，
     # 在 Salamander 之上对 QUIC 长包头再做分片填充；min/max_packet_size 用内核默认值）
     local otype; otype=$(echo "$node_json" | jq -r '.obfs_type // "salamander"')
+    # BBR 配置档（sing-box 1.14+）：conservative / standard / aggressive；未设置不写
+    local bbr;   bbr=$(echo "$node_json"   | jq -r '.bbr_profile // ""')
 
     jq -n \
         --arg tag "$tag" --argjson p "$port" --arg pass "$pass" \
         --arg sni "$sni" --arg cert "$cert" --arg key "$key" \
         --argjson up "$up" --argjson down "$down" --arg masq "$masq" --arg obfs "$obfs" \
-        --arg otype "$otype" \
+        --arg otype "$otype" --arg bbr "$bbr" \
     '{
         type: "hysteria2",
         tag: $tag,
@@ -81,6 +83,7 @@ _sb_hy2_build_inbound_base() {
     + (if $up   > 0 then { up_mbps: $up }     else {} end)
     + (if $down > 0 then { down_mbps: $down } else {} end)
     + (if $obfs != "" then { obfs: { type: $otype, password: $obfs } } else {} end)
+    + (if $bbr  != "" then { bbr_profile: $bbr } else {} end)
     + (if $masq != ""
        then { masquerade: { type: "proxy", url: $masq, rewrite_host: true } }
        else {} end)
@@ -138,7 +141,8 @@ _sb_hy2_uri() {
     local hop; hop=$(echo "$node" | jq -r '.hop_ports // ""')
 
     local ip; ip=$(get_ipv4)
-    local uri="hysteria2://${pass}@${ip}:${port}${hop:+,$hop}?insecure=${insec}&sni=${sni}"
+    local uri
+    uri="hysteria2://${pass}@${ip}:${port}${hop:+,$hop}?insecure=${insec}&sni=${sni}$(psm_pin_q "$node" pinSHA256)"
     [[ -n "$obfs" ]] && uri="${uri}&obfs=${otype}&obfs-password=${obfs}"
     uri="${uri}#PSM-${tag}"
 
@@ -161,6 +165,9 @@ _sb_hy2_uri() {
     [[ -n "$obfs" ]] && obfs_yaml=$'\n    obfs: '"${otype}"$'\n    obfs-password: '"${obfs}"
     [[ -n "$hop" ]] && obfs_yaml="${obfs_yaml}"$'\n    ports: '"${hop}"
     echo -e "\n${BOLD}$(t sb.hy2.clash_label):${NC}"
+    # a self-signed certificate: mihomo pins it (fingerprint) — see psm_node_pins
+    local pin_yaml; pin_yaml=$(psm_pin_yaml "$node")
+    [[ -n "$pin_yaml" ]] && pin_yaml=$'\n'"$pin_yaml"
     cat <<EOF
 proxies:
   - name: PSM-${tag}
@@ -169,7 +176,7 @@ proxies:
     port: ${port}
     password: "${pass}"
     sni: ${sni}${obfs_yaml}
-    skip-cert-verify: $([[ "$insec" == "1" ]] && echo true || echo false)
+    skip-cert-verify: $([[ "$insec" == "1" ]] && echo true || echo false)${pin_yaml}
 EOF
 }
 
@@ -227,6 +234,12 @@ sb_hy2_add_node() {
         fi
     fi
 
+    # BBR 配置档（sing-box 1.14+）：只在不限速、走 BBR 时有意义
+    local bbr_profile=""
+    if (( up == 0 && down == 0 )) && _sb_version_ge "$(_sb_installed_version)" "1.14.0"; then
+        ask_hy2_bbr_profile bbr_profile
+    fi
+
     local hop_ports=""
     source "$LIB_DIR/hop.sh"; ask_hy2_hop_ports hop_ports "$port" "$tag"
 
@@ -236,11 +249,12 @@ sb_hy2_add_node() {
         --arg domain "$domain" --arg sni "$sni" \
         --arg cert "$cert_path" --arg key "$key_path" --argjson insec "$insecure" \
         --argjson up "$up" --argjson down "$down" --arg masq "$masq" --arg obfs "$obfs_pass" \
-        --arg otype "$obfs_type" \
+        --arg otype "$obfs_type" --arg bbr "$bbr_profile" \
         '{tag:$tag, port:$port, password:$pass, domain:$domain, sni:$sni,
           cert_path:$cert, key_path:$key, insecure:$insec, up:$up, down:$down,
           masquerade:$masq, obfs_pass:$obfs}
          | (if $obfs != "" then .obfs_type = $otype else . end)
+         | (if $bbr != "" then .bbr_profile = $bbr else . end)
          | (if $hop != "" then .hop_ports = $hop else . end)')
 
     local _prev_store; _prev_store=$(_sb_hy2_load)
